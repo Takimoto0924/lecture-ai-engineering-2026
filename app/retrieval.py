@@ -20,6 +20,11 @@ from app.config import (
     RAG_GRAPH, GRAPH_START_K, GRAPH_HOPS, GRAPH_MAX_RESULTS,
 )
 
+HYBRID_START_K = 3
+HYBRID_HOPS = 2
+HYBRID_MAX_RESULTS = 5
+HYBRID_DIVERSITY_BONUS = 0.15
+
 
 def get_all_materials() -> str:
     """全資料を、講義・章・ページの情報付きで1つの文字列にまとめる。"""
@@ -124,18 +129,35 @@ def open_index(path: Path):
         db.close()
 
 
-def search(query: str) -> list[dict]:
-    """質問を埋め込み、近いページを最大RAG_TOP_K件返す。"""
+def _validate_query(query: str) -> str:
     if not isinstance(query, str) or not query.strip():
         raise ValueError("検索語が空です。")
+    return query.strip()
+
+
+def _nearest_pages(db, vector: list[float], limit: int, page_ids: set[str] | None = None) -> list[dict]:
+    page_filter = ""
+    parameters = [sqlite_vec.serialize_float32(vector)]
+    if page_ids is not None:
+        if not page_ids:
+            return []
+        page_filter = f"WHERE page_id IN ({','.join('?' for _ in page_ids)})"
+        parameters.extend(sorted(page_ids))
+    parameters.append(limit)
+    rows = db.execute(f"""
+        SELECT page_id, document_id, lecture, document_title, section, title, page, content,
+               vec_distance_cosine(embedding, ?) AS distance
+        FROM chunks {page_filter} ORDER BY distance, page_id LIMIT ?
+    """, parameters)
+    return [dict(row) for row in rows]
+
+
+def search(query: str, top_k: int = RAG_TOP_K) -> list[dict]:
+    """質問を埋め込み、近いページを最大top_k件返す。"""
+    query = _validate_query(query)
     with open_index(RAG_DB) as db:
-        vector = embed_text(query.strip(), "RETRIEVAL_QUERY")
-        rows = db.execute("""
-            SELECT page_id, document_id, lecture, document_title, section, title, page, content,
-                   vec_distance_cosine(embedding, ?) AS distance
-            FROM chunks ORDER BY distance, page_id LIMIT ?
-        """, (sqlite_vec.serialize_float32(vector), RAG_TOP_K))
-        return [dict(row) for row in rows]
+        vector = embed_text(query, "RETRIEVAL_QUERY")
+        return _nearest_pages(db, vector, top_k)
 
 
 def search_graph(query: str) -> dict:
@@ -184,6 +206,130 @@ def search_graph(query: str) -> dict:
     return {"seeds": results, "expanded": expanded[:max(0, GRAPH_MAX_RESULTS - len(results))],
             "max_hops": GRAPH_HOPS}
 
+
+def _tree_chapters(tree: dict, pages: dict[str, dict]) -> dict[str, str]:
+    """Treeの最も近い章をページIDに対応付ける。章直下でないページは資料名を使う。"""
+    chapters = {}
+    document_ids = {page["document_id"] for page in pages.values()}
+
+    def visit(node: dict, chapter: str) -> None:
+        if node["kind"] == "section":
+            chapter = node["title"]
+        elif node["kind"] == "page" and node["id"] in pages:
+            chapters[node["id"]] = chapter
+        for child in node.get("children", []):
+            visit(child, chapter)
+
+    for document in tree.get("children", []):
+        if document["id"] not in document_ids:
+            continue
+        for child in document.get("children", []):
+            visit(child, document["title"])
+    missing = pages.keys() - chapters.keys()
+    if missing:
+        raise ValueError(f"Treeに章情報がないページがあります: {', '.join(sorted(missing))}")
+    return chapters
+
+
+def hybrid_search(query: str) -> dict:
+    """上位ベクトル検索からGraphを2 hop探索し、Treeの章多様性を加味して本文を選ぶ。"""
+    query = _validate_query(query)
+    pages = {page["page_id"]: page for page in load_pages(RAG_SOURCE)}
+    tree = json.loads(RAG_TREE.read_text(encoding="utf-8"))
+    chapters = _tree_chapters(tree, pages)
+    graph = json.loads(RAG_GRAPH.read_text(encoding="utf-8"))
+
+    nodes = {
+        node["id"]: node for node in graph["nodes"]
+        if node["kind"] == "term" or node["id"] in pages
+    }
+    adjacent = defaultdict(set)
+    for edge in graph["edges"]:
+        a, b = edge["source"], edge["target"]
+        if edge["relation"] in ("mentions", "next_page") and a in nodes and b in nodes:
+            adjacent[a].add(b)
+            adjacent[b].add(a)
+
+    with open_index(RAG_DB) as db:
+        vector = embed_text(query, "RETRIEVAL_QUERY")
+        seeds = [
+            hit for hit in _nearest_pages(db, vector, HYBRID_START_K, set(pages))
+            if hit["page_id"] in pages
+        ]
+        if not seeds:
+            return {"results": []}
+
+        seed_ranks = {seed["page_id"]: rank for rank, seed in enumerate(seeds, 1)}
+        paths = {}
+        seed_ids = set(seed_ranks)
+        for seed in seeds:
+            root = seed["page_id"]
+            queue = deque([(root, [root])])
+            visited = {root}
+            while queue:
+                current, path = queue.popleft()
+                hops = len(path) - 1
+                if hops >= HYBRID_HOPS:
+                    continue
+                for neighbor in sorted(adjacent[current]):
+                    if neighbor in visited:
+                        continue
+                    visited.add(neighbor)
+                    route = path + [neighbor]
+                    queue.append((neighbor, route))
+                    if neighbor not in pages or neighbor in seed_ids:
+                        continue
+                    priority = (len(route) - 1, seed_ranks[root], tuple(route))
+                    if neighbor not in paths or priority < paths[neighbor][0]:
+                        paths[neighbor] = (priority, route)
+
+        candidate_ids = seed_ids | paths.keys()
+        ranked_pages = _nearest_pages(db, vector, len(candidate_ids), candidate_ids)
+
+    candidates = []
+    for page in ranked_pages:
+        page_id = page["page_id"]
+        route_entry = paths.get(page_id)
+        route = route_entry[1] if route_entry else None
+        page["chapter"] = chapters[page_id]
+        page["graph_hops"] = len(route) - 1 if route else 0
+        page["graph_path"] = [
+            {"id": node_id, "title": nodes[node_id]["title"]}
+            for node_id in route
+        ] if route else []
+        page["seed_rank"] = seed_ranks.get(page_id)
+        page["relevance"] = max(0.0, min(1.0, 1.0 - page["distance"] / 2))
+        candidates.append(page)
+
+    selected = []
+    chapter_counts = defaultdict(int)
+    while candidates and len(selected) < HYBRID_MAX_RESULTS:
+        def selection_score(page: dict) -> float:
+            return page["relevance"] + (
+                HYBRID_DIVERSITY_BONUS / (1 + chapter_counts[page["chapter"]])
+            )
+
+        chosen = min(
+            candidates,
+            key=lambda page: (-selection_score(page), page["distance"], page["page_id"]),
+        )
+        chosen_score = selection_score(chosen)
+        candidates.remove(chosen)
+        chapter_counts[chosen["chapter"]] += 1
+
+        reasons = []
+        if chosen["seed_rank"] is not None:
+            reasons.append(f"ベクトル検索上位{chosen['seed_rank']}位")
+        else:
+            reasons.append(f"Graphを{chosen['graph_hops']} hop探索")
+        reasons.append(f"質問との関連度 {chosen['relevance']:.2f}")
+        if chapter_counts[chosen["chapter"]] == 1 and len(selected) > 0:
+            reasons.append("未選択の章を優先")
+        chosen["selection_reason"] = "、".join(reasons)
+        chosen["hybrid_score"] = round(chosen_score, 4)
+        selected.append(chosen)
+
+    return {"results": selected}
 
 
 def run_full_context(agent, question: str, model, instructions: str, prompt_template: str):

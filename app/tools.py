@@ -144,3 +144,20 @@ def search_graph(query: str) -> str:
         return json.dumps({"error": str(e)}, ensure_ascii=False)
     except APIError as e:
         return json.dumps({"error": api_error_message(e.code)}, ensure_ascii=False)
+
+
+def search_hybrid(query: str) -> str:
+    """ベクトル検索・Graph・Treeを組み合わせて、関連する講義ページを最大5件返す。
+
+    第1〜3回の講義内容について、検索結果の根拠を複数の章から集めたいときに使う。
+    """
+    import sqlite3
+    from google.genai.errors import APIError
+    from app.retrieval import hybrid_search
+
+    try:
+        return json.dumps(hybrid_search(query), ensure_ascii=False)
+    except (ValueError, OSError, sqlite3.Error) as e:
+        return json.dumps({"error": str(e), "results": []}, ensure_ascii=False)
+    except APIError as e:
+        return json.dumps({"error": api_error_message(e.code), "results": []}, ensure_ascii=False)
